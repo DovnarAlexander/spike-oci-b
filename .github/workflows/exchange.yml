@@ -1,0 +1,137 @@
+# S3 kit: copy to .github/workflows/exchange.yml in a SCRATCH repository.
+# Needs variables OIDC_DOMAIN_URL, OIDC_CLIENT_ID and secret OIDC_CLIENT_SECRET.
+name: S3 token exchange
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_environment:
+        description: Run the job that uses the runestra environment (true) or the plain job (false)
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  exchange:
+    if: ${{ !inputs.use_environment }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Exchange a GitHub token for an OCI session token
+        shell: bash
+        env:
+          OIDC_DOMAIN_URL: ${{ vars.OIDC_DOMAIN_URL }}
+          OIDC_CLIENT_ID: ${{ vars.OIDC_CLIENT_ID }}
+          OIDC_CLIENT_SECRET: ${{ secrets.OIDC_CLIENT_SECRET }}
+        run: |
+          set -uo pipefail
+          domain_url="${OIDC_DOMAIN_URL%/}"
+          b64json() {
+            local p
+            p="$(printf '%s' "$1" | cut -d. -f2 | tr '_-' '/+')"
+            while (( ${#p} % 4 )); do p="${p}="; done
+            printf '%s' "${p}" | base64 -d 2>/dev/null
+          }
+          # No fail-on-error flag on curl: the error body is what names a refusal.
+          gh_response="$(mktemp)"
+          gh_status="$(curl -sS -o "${gh_response}" -w '%{http_code}' \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${domain_url}" || true)"
+          id_token="$(jq -r '.value // empty' < "${gh_response}" 2>/dev/null || true)"
+          rm -f "${gh_response}"
+          if [[ -z "${id_token}" ]]; then
+            echo "GitHub returned HTTP ${gh_status} and no token"
+            exit 1
+          fi
+          echo "::add-mask::${id_token}"
+          echo "github token sub = $(b64json "${id_token}" | jq -r '.sub // "<absent>"')"
+          work="$(mktemp -d)"
+          openssl genrsa -out "${work}/k.pem" 2048 >/dev/null 2>&1
+          openssl rsa -pubout -in "${work}/k.pem" -out "${work}/kp.pem" >/dev/null 2>&1
+          public_key="$(grep -v -- '-----' "${work}/kp.pem" | tr -d '\n')"
+          exchange="${work}/exchange.json"
+          status="$(curl -sS -o "${exchange}" -w '%{http_code}' -X POST "${domain_url}/oauth2/v1/token" \
+            -u "${OIDC_CLIENT_ID}:${OIDC_CLIENT_SECRET}" \
+            --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+            --data-urlencode "requested_token_type=urn:oci:token-type:oci-upst" \
+            --data-urlencode "subject_token=${id_token}" \
+            --data-urlencode "subject_token_type=jwt" \
+            --data-urlencode "public_key=${public_key}" || true)"
+          echo "exchange http status = ${status}"
+          upst="$(jq -r '.token // empty' < "${exchange}" 2>/dev/null || true)"
+          if [[ -z "${upst}" ]]; then
+            echo "result = refused"
+            # A non-200 body carries the error text, never a token.
+            echo "response body = $(tr -d '\n' < "${exchange}")"
+            exit 0
+          fi
+          echo "::add-mask::${upst}"
+          echo "result = issued"
+          claims="$(b64json "${upst}")"
+          for c in iss sub source_authn_prin exp; do
+            echo "upst ${c} = $(jq -r --arg c "${c}" '.[$c] // "<absent>"' <<<"${claims}")"
+          done
+          rm -rf "${work}"
+
+  exchange-environment:
+    if: ${{ inputs.use_environment }}
+    runs-on: ubuntu-latest
+    environment: runestra
+    steps:
+      - name: Exchange a GitHub token for an OCI session token
+        shell: bash
+        env:
+          OIDC_DOMAIN_URL: ${{ vars.OIDC_DOMAIN_URL }}
+          OIDC_CLIENT_ID: ${{ vars.OIDC_CLIENT_ID }}
+          OIDC_CLIENT_SECRET: ${{ secrets.OIDC_CLIENT_SECRET }}
+        run: |
+          set -uo pipefail
+          domain_url="${OIDC_DOMAIN_URL%/}"
+          b64json() {
+            local p
+            p="$(printf '%s' "$1" | cut -d. -f2 | tr '_-' '/+')"
+            while (( ${#p} % 4 )); do p="${p}="; done
+            printf '%s' "${p}" | base64 -d 2>/dev/null
+          }
+          # No fail-on-error flag on curl: the error body is what names a refusal.
+          gh_response="$(mktemp)"
+          gh_status="$(curl -sS -o "${gh_response}" -w '%{http_code}' \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${domain_url}" || true)"
+          id_token="$(jq -r '.value // empty' < "${gh_response}" 2>/dev/null || true)"
+          rm -f "${gh_response}"
+          if [[ -z "${id_token}" ]]; then
+            echo "GitHub returned HTTP ${gh_status} and no token"
+            exit 1
+          fi
+          echo "::add-mask::${id_token}"
+          echo "github token sub = $(b64json "${id_token}" | jq -r '.sub // "<absent>"')"
+          work="$(mktemp -d)"
+          openssl genrsa -out "${work}/k.pem" 2048 >/dev/null 2>&1
+          openssl rsa -pubout -in "${work}/k.pem" -out "${work}/kp.pem" >/dev/null 2>&1
+          public_key="$(grep -v -- '-----' "${work}/kp.pem" | tr -d '\n')"
+          exchange="${work}/exchange.json"
+          status="$(curl -sS -o "${exchange}" -w '%{http_code}' -X POST "${domain_url}/oauth2/v1/token" \
+            -u "${OIDC_CLIENT_ID}:${OIDC_CLIENT_SECRET}" \
+            --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+            --data-urlencode "requested_token_type=urn:oci:token-type:oci-upst" \
+            --data-urlencode "subject_token=${id_token}" \
+            --data-urlencode "subject_token_type=jwt" \
+            --data-urlencode "public_key=${public_key}" || true)"
+          echo "exchange http status = ${status}"
+          upst="$(jq -r '.token // empty' < "${exchange}" 2>/dev/null || true)"
+          if [[ -z "${upst}" ]]; then
+            echo "result = refused"
+            # A non-200 body carries the error text, never a token.
+            echo "response body = $(tr -d '\n' < "${exchange}")"
+            exit 0
+          fi
+          echo "::add-mask::${upst}"
+          echo "result = issued"
+          claims="$(b64json "${upst}")"
+          for c in iss sub source_authn_prin exp; do
+            echo "upst ${c} = $(jq -r --arg c "${c}" '.[$c] // "<absent>"' <<<"${claims}")"
+          done
+          rm -rf "${work}"
